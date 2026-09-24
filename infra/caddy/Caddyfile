@@ -1,0 +1,34 @@
+{$DOMAIN:localhost} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy api:3000
+	}
+
+	handle /health/* {
+		reverse_proxy api:3000
+	}
+
+	handle {
+		reverse_proxy web:80
+	}
+}
+
+{$STORAGE_DOMAIN:storage.localhost} {
+	encode zstd gzip
+
+	@cors method OPTIONS
+	handle @cors {
+		header Access-Control-Allow-Origin "*"
+		header Access-Control-Allow-Methods "GET, PUT, HEAD, POST, OPTIONS"
+		header Access-Control-Allow-Headers "*"
+		header Access-Control-Expose-Headers "ETag"
+		header Vary "Origin"
+		respond 204
+	}
+
+	header Access-Control-Allow-Origin "*"
+	header Access-Control-Expose-Headers "ETag"
+	header Vary "Origin"
+	reverse_proxy minio:9000
+}

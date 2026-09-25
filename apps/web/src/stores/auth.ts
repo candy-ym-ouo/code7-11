@@ -18,6 +18,7 @@ export const useAuthStore = defineStore("auth", () => {
   const isAuthenticated = computed(() => Boolean(user.value && getAccessToken()));
   const isVerified = computed(() => Boolean(user.value?.emailVerified));
   const canModerate = computed(() => user.value?.role === "moderator" || user.value?.role === "admin");
+  const isAdmin = computed(() => user.value?.role === "admin");
 
   async function bootstrap() {
     try {
@@ -56,5 +57,5 @@ export const useAuthStore = defineStore("auth", () => {
     user.value = null;
   }
 
-  return { user, ready, isAuthenticated, isVerified, canModerate, bootstrap, login, register, logout };
+  return { user, ready, isAuthenticated, isVerified, canModerate, isAdmin, bootstrap, login, register, logout };
 });

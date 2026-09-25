@@ -6,9 +6,45 @@ import { AppError, conflict, notFound } from "../errors";
 import { requireAdmin, requireModerator } from "../auth";
 import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import {
+  assertModerationScope,
+  buildQueueScopeFilter,
+  loadActiveDelegations,
+  type ScopePoint
+} from "../delegation";
 
 export async function moderationRoutes(app: FastifyInstance) {
-  app.get("/moderation/queue", { preHandler: requireModerator }, async () => {
+  app.get("/moderation/queue", { preHandler: requireModerator }, async (request) => {
+    const user = request.user!;
+    const scoped = user.role !== "admin";
+    const delegations = scoped ? await loadActiveDelegations(user.id) : [];
+
+    // 队列在接口层即按委托范围过滤：审核员只能看到被授权的分类与地区。
+    const featureScope = scoped
+      ? buildQueueScopeFilter(delegations, {
+          categorySql: "fr.payload->>'categoryKey'",
+          longitudeSql: "(fr.payload->>'longitude')::double precision",
+          latitudeSql: "(fr.payload->>'latitude')::double precision"
+        }, 1)
+      : null;
+    const commentScope = scoped
+      ? buildQueueScopeFilter(delegations, {
+          categorySql: "mf.category_key",
+          longitudeSql: "ST_X(mf.geom::geometry)",
+          latitudeSql: "ST_Y(mf.geom::geometry)"
+        }, 1)
+      : null;
+    const reportScope = scoped
+      ? buildQueueScopeFilter(delegations, {
+          categorySql: "COALESCE(mf.category_key, cmf.category_key)",
+          longitudeSql: "ST_X(COALESCE(mf.geom, cmf.geom)::geometry)",
+          latitudeSql: "ST_Y(COALESCE(mf.geom, cmf.geom)::geometry)"
+        }, 1)
+      : null;
+    // 媒体隐私确认是高风险操作：没有高风险委托的审核员看不到媒体队列。
+    const canSeeMedia = !scoped || delegations.some((scope) => scope.allowHighRisk);
+    const emptyMedia = Promise.resolve({ rows: [] as Record<string, never>[], rowCount: 0 });
+
     const [features, comments, media, reports] = await Promise.all([
       query(
         `SELECT fr.id AS revision_id, fr.feature_id, fr.revision_no, fr.payload, fr.submitted_at,
@@ -17,28 +53,48 @@ export async function moderationRoutes(app: FastifyInstance) {
          JOIN map_features mf ON mf.id = fr.feature_id
          JOIN users u ON u.id = fr.author_id
          WHERE fr.status = 'pending' AND mf.deleted_at IS NULL
+         ${featureScope ? `AND (${featureScope.sql})` : ""}
          ORDER BY fr.submitted_at ASC
-         LIMIT 100`
+         LIMIT 100`,
+        featureScope?.values ?? []
       ),
       query(
-        `SELECT c.id, c.feature_id, c.body, c.status, c.created_at, u.display_name AS author_name
-         FROM comments c JOIN users u ON u.id = c.author_id
+        `SELECT c.id, c.feature_id, c.body, c.status, c.created_at, u.display_name AS author_name,
+                mf.category_key,
+                ST_X(mf.geom::geometry) AS longitude,
+                ST_Y(mf.geom::geometry) AS latitude
+         FROM comments c
+         JOIN users u ON u.id = c.author_id
+         JOIN map_features mf ON mf.id = c.feature_id
          WHERE c.status = 'pending' AND c.deleted_at IS NULL
-         ORDER BY c.created_at ASC LIMIT 100`
+         ${commentScope ? `AND (${commentScope.sql})` : ""}
+         ORDER BY c.created_at ASC LIMIT 100`,
+        commentScope?.values ?? []
       ),
-      query(
-        `SELECT ma.id, ma.original_filename, ma.privacy_status, ma.privacy_report,
-                ma.processed_object_key, ma.created_at, u.display_name AS owner_name
-         FROM media_assets ma JOIN users u ON u.id = ma.owner_id
-         WHERE ma.privacy_status = 'manual_review' AND ma.deleted_at IS NULL
-         ORDER BY ma.created_at ASC LIMIT 100`
-      ),
+      canSeeMedia
+        ? query(
+            `SELECT ma.id, ma.original_filename, ma.privacy_status, ma.privacy_report,
+                    ma.processed_object_key, ma.created_at, u.display_name AS owner_name
+             FROM media_assets ma JOIN users u ON u.id = ma.owner_id
+             WHERE ma.privacy_status = 'manual_review' AND ma.deleted_at IS NULL
+             ORDER BY ma.created_at ASC LIMIT 100`
+          )
+        : emptyMedia,
       query(
         `SELECT r.id, r.target_type, r.target_id, r.reason_code, r.notes, r.created_at,
-                u.display_name AS reporter_name
-         FROM reports r JOIN users u ON u.id = r.reporter_id
+                u.display_name AS reporter_name,
+                COALESCE(mf.category_key, cmf.category_key) AS category_key,
+                ST_X(COALESCE(mf.geom, cmf.geom)::geometry) AS longitude,
+                ST_Y(COALESCE(mf.geom, cmf.geom)::geometry) AS latitude
+         FROM reports r
+         JOIN users u ON u.id = r.reporter_id
+         LEFT JOIN map_features mf ON r.target_type = 'feature' AND mf.id = r.target_id
+         LEFT JOIN comments rc ON r.target_type = 'comment' AND rc.id = r.target_id
+         LEFT JOIN map_features cmf ON cmf.id = rc.feature_id
          WHERE r.status = 'open'
-         ORDER BY r.created_at ASC LIMIT 100`
+         ${reportScope ? `AND (${reportScope.sql})` : ""}
+         ORDER BY r.created_at ASC LIMIT 100`,
+        reportScope?.values ?? []
       )
     ]);
 
@@ -58,6 +114,7 @@ export async function moderationRoutes(app: FastifyInstance) {
 
   app.post("/moderation/features/:id/approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    await assertModerationScope(request.user!, await pendingRevisionPoint(params.id), { action: "feature.approve" });
     await transaction(async (client) => {
       const revisionResult = await client.query<{
         id: string;
@@ -134,6 +191,7 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/reject", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
+    await assertModerationScope(request.user!, await pendingRevisionPoint(params.id), { action: "feature.reject" });
     await transaction(async (client) => {
       const revision = await activePendingRevision(client, params.id);
       await client.query(
@@ -171,6 +229,7 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/request-changes", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
+    await assertModerationScope(request.user!, await pendingRevisionPoint(params.id), { action: "feature.request_changes" });
     await transaction(async (client) => {
       const revision = await activePendingRevision(client, params.id);
       await client.query(
@@ -208,6 +267,8 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/hide", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
+    // 隐藏属于高风险操作，需要带 allow_high_risk 的委托。
+    await assertModerationScope(request.user!, await featurePoint(params.id), { highRisk: true, action: "feature.hide" });
     await transaction(async (client) => {
       const result = await client.query(
         "UPDATE map_features SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING owner_id, current_revision_id",
@@ -256,6 +317,7 @@ export async function moderationRoutes(app: FastifyInstance) {
 
   app.post("/moderation/comments/:id/approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    await assertModerationScope(request.user!, await commentPoint(params.id), { action: "comment.approve" });
     await transaction(async (client) => {
       const result = await client.query<{ author_id: string }>(
         `UPDATE comments SET status = 'published', reviewed_at = now(), reviewer_id = $2,
@@ -285,6 +347,7 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/comments/:id/reject", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
+    await assertModerationScope(request.user!, await commentPoint(params.id), { action: "comment.reject" });
     await transaction(async (client) => {
       const result = await client.query<{ author_id: string }>(
         `UPDATE comments SET status = 'rejected', reviewed_at = now(), reviewer_id = $2,
@@ -315,6 +378,7 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/comments/:id/hide", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
+    await assertModerationScope(request.user!, await commentPoint(params.id), { highRisk: true, action: "comment.hide" });
     await transaction(async (client) => {
       const result = await client.query(
         "UPDATE comments SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id",
@@ -339,6 +403,18 @@ export async function moderationRoutes(app: FastifyInstance) {
       action: z.enum(["none", "hide", "restore"]).default("none"),
       notes: z.string().trim().max(1000).optional()
     }).parse(request.body);
+
+    // 处理动作 hide/restore 属于高风险操作，按目标内容的分类与地区校验委托范围。
+    const targetResult = await query<{ target_type: string; target_id: string }>(
+      "SELECT target_type, target_id FROM reports WHERE id = $1 AND status = 'open'",
+      [params.id]
+    );
+    const target = targetResult.rows[0];
+    if (!target) throw notFound("Open report not found");
+    await assertModerationScope(request.user!, await reportTargetPoint(target), {
+      highRisk: input.action !== "none",
+      action: "report.resolve"
+    });
 
     await transaction(async (client) => {
       const reportResult = await client.query<{ target_type: string; target_id: string; reporter_id: string }>(
@@ -412,4 +488,52 @@ async function activePendingRevision(client: Parameters<Parameters<typeof transa
   const revision = result.rows[0];
   if (!revision) throw notFound("Pending revision not found");
   return revision;
+}
+
+// 待发布内容以最新待审修订的 payload 为准（修订可能改动分类与位置）。
+async function pendingRevisionPoint(featureId: string): Promise<ScopePoint> {
+  const result = await query<{
+    payload: { categoryKey: string; longitude: number; latitude: number };
+  }>(
+    `SELECT fr.payload
+     FROM feature_revisions fr
+     JOIN map_features mf ON mf.id = fr.feature_id
+     WHERE fr.feature_id = $1 AND fr.status = 'pending' AND mf.deleted_at IS NULL
+     ORDER BY fr.revision_no DESC LIMIT 1`,
+    [featureId]
+  );
+  const row = result.rows[0];
+  if (!row) throw notFound("Pending revision not found");
+  return {
+    categoryKey: row.payload.categoryKey,
+    longitude: row.payload.longitude,
+    latitude: row.payload.latitude
+  };
+}
+
+async function featurePoint(featureId: string): Promise<ScopePoint> {
+  const result = await query<{ category_key: string; longitude: number; latitude: number }>(
+    `SELECT category_key, ST_X(geom::geometry) AS longitude, ST_Y(geom::geometry) AS latitude
+     FROM map_features WHERE id = $1 AND deleted_at IS NULL`,
+    [featureId]
+  );
+  const row = result.rows[0];
+  if (!row) throw notFound("Feature not found");
+  return { categoryKey: row.category_key, longitude: row.longitude, latitude: row.latitude };
+}
+
+async function commentPoint(commentId: string): Promise<ScopePoint> {
+  const result = await query<{ category_key: string; longitude: number; latitude: number }>(
+    `SELECT mf.category_key, ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+     FROM comments c JOIN map_features mf ON mf.id = c.feature_id
+     WHERE c.id = $1 AND c.deleted_at IS NULL`,
+    [commentId]
+  );
+  const row = result.rows[0];
+  if (!row) throw notFound("Comment not found");
+  return { categoryKey: row.category_key, longitude: row.longitude, latitude: row.latitude };
+}
+
+async function reportTargetPoint(target: { target_type: string; target_id: string }): Promise<ScopePoint> {
+  return target.target_type === "feature" ? featurePoint(target.target_id) : commentPoint(target.target_id);
 }

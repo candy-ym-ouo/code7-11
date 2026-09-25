@@ -28,6 +28,7 @@ async function logout() {
         <RouterLink v-if="auth.isAuthenticated" to="/me/comments">评论</RouterLink>
         <RouterLink v-if="auth.isAuthenticated" to="/me/notifications">通知</RouterLink>
         <RouterLink v-if="auth.canModerate" to="/moderation">审核</RouterLink>
+        <RouterLink v-if="auth.isAdmin" to="/admin/delegations">权限委托</RouterLink>
       </nav>
       <div class="account-nav">
         <template v-if="auth.user">

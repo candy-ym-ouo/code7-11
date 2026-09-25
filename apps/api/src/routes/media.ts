@@ -16,6 +16,7 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import { assertAnyDelegation, assertMediaPrivacyScope } from "../delegation";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -176,6 +177,7 @@ export async function mediaRoutes(app: FastifyInstance) {
 
   app.get("/media/:id/preview", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    await assertAnyDelegation(request.user!, "media.preview");
     const result = await query<{ processed_object_key: string | null; privacy_status: string }>(
       "SELECT processed_object_key, privacy_status FROM media_assets WHERE id = $1 AND deleted_at IS NULL",
       [params.id]
@@ -197,6 +199,8 @@ export async function mediaRoutes(app: FastifyInstance) {
 
   app.post("/media/:id/privacy-approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    // 隐私确认发布会公开派生图，属于高风险操作，需要带 allow_high_risk 的委托。
+    await assertMediaPrivacyScope(request.user!, "media.privacy_approve");
     const result = await query<{
       id: string;
       privacy_status: string;

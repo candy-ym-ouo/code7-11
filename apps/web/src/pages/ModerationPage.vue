@@ -1,17 +1,27 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from "vue";
-import { apiFetch } from "../lib/api";
+import { apiFetch, ApiError } from "../lib/api";
+import { canModerateItem, scopeSummary, type ModerationScope } from "../lib/scope";
 
 type FeatureItem = {
   revision_id: string;
   feature_id: string;
   revision_no: number;
-  payload: { title: string; description: string; categoryKey: string; mediaIds?: string[] };
+  payload: { title: string; description: string; categoryKey: string; longitude: number; latitude: number; mediaIds?: string[] };
   submitted_at: string;
   feature_status: string;
   author_name: string;
 };
-type CommentItem = { id: string; feature_id: string; body: string; created_at: string; author_name: string };
+type CommentItem = {
+  id: string;
+  feature_id: string;
+  body: string;
+  created_at: string;
+  author_name: string;
+  category_key: string;
+  longitude: number;
+  latitude: number;
+};
 type MediaItem = {
   id: string;
   original_filename: string;
@@ -29,6 +39,9 @@ type ReportItem = {
   notes: string | null;
   created_at: string;
   reporter_name: string;
+  category_key: string | null;
+  longitude: number | null;
+  latitude: number | null;
 };
 type Queue = {
   counts: { features: number; comments: number; media: number; reports: number };
@@ -39,16 +52,30 @@ type Queue = {
 };
 
 const queue = ref<Queue>({ counts: { features: 0, comments: 0, media: 0, reports: 0 }, features: [], comments: [], media: [], reports: [] });
+const scope = ref<ModerationScope | null>(null);
 const error = ref("");
 const notice = ref("");
 const active = ref<"features" | "comments" | "media" | "reports">("features");
 const previews = reactive<Record<string, string>>({});
 
+function describeError(cause: unknown, fallback: string): string {
+  if (cause instanceof ApiError && cause.code === "DELEGATION_SCOPE_EXCEEDED") {
+    return "该内容不在你的委托范围内，操作已被拒绝并写入审计。";
+  }
+  return cause instanceof Error ? cause.message : fallback;
+}
+
 async function load() {
   try {
-    queue.value = await apiFetch<Queue>("/moderation/queue");
+    const [queueData, scopeData] = await Promise.all([
+      apiFetch<Queue>("/moderation/queue"),
+      apiFetch<ModerationScope>("/moderation/scope")
+    ]);
+    queue.value = queueData;
+    scope.value = scopeData;
+    if (active.value === "media" && !scopeData.canApproveMedia) active.value = "features";
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "加载审核队列失败";
+    error.value = describeError(cause, "加载审核队列失败");
   }
 }
 
@@ -66,7 +93,7 @@ async function featureAction(id: string, action: "approve" | "reject" | "request
     notice.value = "审核动作已完成。";
     await load();
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "审核失败";
+    error.value = describeError(cause, "审核失败");
   }
 }
 
@@ -78,7 +105,7 @@ async function commentAction(id: string, action: "approve" | "reject" | "hide") 
     notice.value = "评论审核完成。";
     await load();
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "评论审核失败";
+    error.value = describeError(cause, "评论审核失败");
   }
 }
 
@@ -87,7 +114,7 @@ async function loadPreview(item: MediaItem) {
     const result = await apiFetch<{ url: string }>(`/media/${item.id}/preview`);
     previews[item.id] = result.url;
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "无法生成预览";
+    error.value = describeError(cause, "无法生成预览");
   }
 }
 
@@ -97,14 +124,24 @@ async function approveMedia(id: string) {
     notice.value = "媒体隐私处理已确认，现已转为 ready。";
     await load();
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "隐私确认失败";
+    error.value = describeError(cause, "隐私确认失败");
   }
 }
 
 async function resolveReport(id: string) {
+  const item = queue.value.reports.find((report) => report.id === id);
   const actionRaw = window.prompt("处理动作：none、hide、restore", "none") ?? "none";
   const statusRaw = window.prompt("处理结果：resolved 或 dismissed", actionRaw === "none" ? "dismissed" : "resolved") ?? "dismissed";
   if (!["none", "hide", "restore"].includes(actionRaw) || !["resolved", "dismissed"].includes(statusRaw)) return;
+  // 页面层拒绝：hide/restore 是高风险动作，无高风险委托时不上送请求。
+  if (actionRaw !== "none" && item && !canModerateItem(scope.value, {
+    categoryKey: item.category_key ?? "",
+    longitude: item.longitude,
+    latitude: item.latitude
+  }, { highRisk: true })) {
+    error.value = "隐藏/恢复属于高风险操作，你的委托未包含该范围的高风险授权。";
+    return;
+  }
   try {
     await apiFetch(`/moderation/reports/${id}/resolve`, {
       method: "POST",
@@ -113,7 +150,7 @@ async function resolveReport(id: string) {
     notice.value = "举报已处理。";
     await load();
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "举报处理失败";
+    error.value = describeError(cause, "举报处理失败");
   }
 }
 
@@ -126,12 +163,13 @@ onMounted(load);
       <div><h1>审核工作台</h1><p>所有批准、拒绝、隐私确认和举报处理都会写入审计日志。</p></div>
       <button class="button secondary" type="button" @click="load">刷新队列</button>
     </div>
+    <p v-if="scope" class="notice-box">审核范围：{{ scopeSummary(scope) }}</p>
     <p v-if="error" class="error-box">{{ error }}</p>
     <p v-if="notice" class="success-box">{{ notice }}</p>
     <div class="pill-tabs">
       <button :class="{ active: active === 'features' }" @click="active = 'features'">地点内容 {{ queue.counts.features }}</button>
       <button :class="{ active: active === 'comments' }" @click="active = 'comments'">评论 {{ queue.counts.comments }}</button>
-      <button :class="{ active: active === 'media' }" @click="active = 'media'">隐私媒体 {{ queue.counts.media }}</button>
+      <button v-if="scope?.canApproveMedia" :class="{ active: active === 'media' }" @click="active = 'media'">隐私媒体 {{ queue.counts.media }}</button>
       <button :class="{ active: active === 'reports' }" @click="active = 'reports'">举报 {{ queue.counts.reports }}</button>
     </div>
 
@@ -146,7 +184,12 @@ onMounted(load);
           <button class="button" @click="featureAction(item.feature_id, 'approve')">批准发布</button>
           <button class="button secondary" @click="featureAction(item.feature_id, 'request-changes')">要求修改</button>
           <button class="button danger" @click="featureAction(item.feature_id, 'reject')">拒绝</button>
-          <button class="button ghost" @click="featureAction(item.feature_id, 'hide')">隐藏</button>
+          <button
+            class="button ghost"
+            :disabled="!canModerateItem(scope, { categoryKey: item.payload.categoryKey, longitude: item.payload.longitude, latitude: item.payload.latitude }, { highRisk: true })"
+            title="隐藏属于高风险操作，需要带高风险授权的委托"
+            @click="featureAction(item.feature_id, 'hide')"
+          >隐藏</button>
         </div>
       </div></article>
       <div v-if="!queue.features.length" class="card empty">没有待审核地点内容。</div>
@@ -159,7 +202,12 @@ onMounted(load);
         <div class="inline">
           <button class="button" @click="commentAction(item.id, 'approve')">批准</button>
           <button class="button danger" @click="commentAction(item.id, 'reject')">拒绝</button>
-          <button class="button ghost" @click="commentAction(item.id, 'hide')">隐藏</button>
+          <button
+            class="button ghost"
+            :disabled="!canModerateItem(scope, { categoryKey: item.category_key, longitude: item.longitude, latitude: item.latitude }, { highRisk: true })"
+            title="隐藏属于高风险操作，需要带高风险授权的委托"
+            @click="commentAction(item.id, 'hide')"
+          >隐藏</button>
         </div>
       </div></article>
       <div v-if="!queue.comments.length" class="card empty">没有待审核评论。</div>

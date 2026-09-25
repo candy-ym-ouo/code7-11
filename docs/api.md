@@ -57,8 +57,8 @@
 | `POST` | `/media/uploads` | 创建隔离区签名上传 |
 | `POST` | `/media/uploads/:id/complete` | 提交隐私框并启动服务端处理 |
 | `GET` | `/media/:id` | 查询处理状态 |
-| `GET` | `/media/:id/preview` | 审核员获取短期私有预览 |
-| `POST` | `/media/:id/privacy-approve` | 审核员确认隐私并发布派生图 |
+| `GET` | `/media/:id/preview` | 审核员获取短期私有预览（需有效委托） |
+| `POST` | `/media/:id/privacy-approve` | 审核员确认隐私并发布派生图（高风险，需高风险委托） |
 | `POST` | `/media/:id/retry` | 重试失败处理 |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
@@ -77,14 +77,26 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/moderation/queue` | 内容、评论、媒体和举报队列 |
-| `POST` | `/moderation/features/:id/approve` | 批准内容或修订 |
-| `POST` | `/moderation/features/:id/reject` | 拒绝 |
-| `POST` | `/moderation/features/:id/request-changes` | 要求修改 |
-| `POST` | `/moderation/features/:id/hide` | 隐藏 |
+| `GET` | `/moderation/queue` | 内容、评论、媒体和举报队列（审核员仅见委托范围内条目） |
+| `GET` | `/moderation/scope` | 当前用户的有效委托范围（供页面过滤） |
+| `POST` | `/moderation/features/:id/approve` | 批准内容或修订（限委托范围） |
+| `POST` | `/moderation/features/:id/reject` | 拒绝（限委托范围） |
+| `POST` | `/moderation/features/:id/request-changes` | 要求修改（限委托范围） |
+| `POST` | `/moderation/features/:id/hide` | 隐藏（高风险，需高风险委托） |
 | `POST` | `/moderation/features/:id/restore` | 管理员恢复 |
-| `POST` | `/moderation/comments/:id/approve` | 批准评论 |
-| `POST` | `/moderation/comments/:id/reject` | 拒绝评论 |
-| `POST` | `/moderation/comments/:id/hide` | 隐藏评论 |
-| `POST` | `/moderation/reports/:id/resolve` | 处理举报 |
+| `POST` | `/moderation/comments/:id/approve` | 批准评论（限委托范围） |
+| `POST` | `/moderation/comments/:id/reject` | 拒绝评论（限委托范围） |
+| `POST` | `/moderation/comments/:id/hide` | 隐藏评论（高风险，需高风险委托） |
+| `POST` | `/moderation/reports/:id/resolve` | 处理举报；hide/restore 为高风险动作 |
 | `GET` | `/moderation/audit` | 管理员审计日志 |
+
+## 审核权限委托（管理员）
+
+委托按分类与地区（bbox）授予临时审核范围，最长 30 天；`allowHighRisk` 控制隐藏、媒体隐私确认等高风险操作。委托、撤销、越权拒绝与高风险操作都写入同一审计日志。越权请求返回 `403` 与 `DELEGATION_SCOPE_EXCEEDED`，并记录 `moderation.scope_denied` 审计。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/admin/delegations?status=` | 委托列表（active / revoked / expired / all） |
+| `POST` | `/admin/delegations` | 授予委托：`delegateEmail`、`categoryKeys`（空为全部）、`region`、`regionName`、`allowHighRisk`、`expiresInHours`、`note` |
+| `POST` | `/admin/delegations/:id/revoke` | 撤销委托：`reason` |
+| `GET` | `/admin/delegations/audit` | 委托、撤销、越权拒绝与高风险操作的共同审计视图 |

@@ -212,6 +212,44 @@ export const confirmationSchema = z.object({
   note: z.string().trim().max(500).optional()
 });
 
+// 审核权限委托：按分类与地区授予的临时审核范围。
+export const DELEGATION_MAX_HOURS = 24 * 30;
+
+export const delegationRegionSchema = z.object({
+  minLon: z.number().min(-180).max(180),
+  minLat: z.number().min(-90).max(90),
+  maxLon: z.number().min(-180).max(180),
+  maxLat: z.number().min(-90).max(90)
+}).refine((value) => value.minLon < value.maxLon && value.minLat < value.maxLat, {
+  message: "Region bounds must satisfy min < max"
+});
+export type DelegationRegion = z.infer<typeof delegationRegionSchema>;
+
+export const delegationCreateSchema = z.object({
+  delegateEmail: z.string().trim().email().max(254),
+  // 空数组表示全部分类。
+  categoryKeys: z.array(z.enum(categoryKeys)).max(categoryKeys.length).default([]),
+  // 缺省或 null 表示不限地区。
+  region: delegationRegionSchema.nullable().optional(),
+  regionName: z.string().trim().min(2).max(80).optional(),
+  allowHighRisk: z.boolean().default(false),
+  expiresInHours: z.number().int().min(1).max(DELEGATION_MAX_HOURS),
+  note: z.string().trim().max(500).optional()
+}).superRefine((value, context) => {
+  if (new Set(value.categoryKeys).size !== value.categoryKeys.length) {
+    context.addIssue({ code: "custom", path: ["categoryKeys"], message: "Category keys must be unique" });
+  }
+  if (value.region && !value.regionName) {
+    context.addIssue({ code: "custom", path: ["regionName"], message: "Region name is required when a region is set" });
+  }
+});
+
+export const delegationRevokeSchema = z.object({
+  reason: z.string().trim().min(2).max(500)
+});
+
+export type DelegationCreateInput = z.infer<typeof delegationCreateSchema>;
+
 export const categoryDefinitions = [
   {
     key: "bench",

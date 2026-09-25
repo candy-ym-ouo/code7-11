@@ -13,6 +13,7 @@ const NotificationsPage = () => import("../pages/NotificationsPage.vue");
 const CommentsPage = () => import("../pages/CommentsPage.vue");
 const SettingsPage = () => import("../pages/SettingsPage.vue");
 const ModerationPage = () => import("../pages/ModerationPage.vue");
+const DelegationsPage = () => import("../pages/DelegationsPage.vue");
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -31,6 +32,7 @@ export const router = createRouter({
     { path: "/me/notifications", name: "notifications", component: NotificationsPage, meta: { requiresAuth: true } },
     { path: "/me/settings", name: "settings", component: SettingsPage, meta: { requiresAuth: true } },
     { path: "/moderation", name: "moderation", component: ModerationPage, meta: { requiresAuth: true, requiresModerator: true } },
+    { path: "/admin/delegations", name: "delegations", component: DelegationsPage, meta: { requiresAuth: true, requiresAdmin: true } },
     { path: "/:pathMatch(.*)*", redirect: "/map" }
   ],
   scrollBehavior: () => ({ top: 0 })
@@ -45,6 +47,9 @@ router.beforeEach((to) => {
     return { name: "login", query: { verify: "1", redirect: to.fullPath } };
   }
   if (to.meta.requiresModerator && !auth.canModerate) {
+    return { name: "map" };
+  }
+  if (to.meta.requiresAdmin && !auth.isAdmin) {
     return { name: "map" };
   }
   return true;

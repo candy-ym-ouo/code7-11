@@ -32,4 +32,17 @@ describe("initial migration", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");
   });
+
+  it("adds scoped temporary moderation delegations in migration 0003", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_moderation_delegations.sql"),
+      "utf8"
+    );
+    expect(followup).toContain("CREATE TABLE moderation_delegations");
+    expect(followup).toContain("category_keys text[]");
+    expect(followup).toContain("region jsonb");
+    expect(followup).toContain("allow_high_risk boolean");
+    expect(followup).toContain("expires_at timestamptz NOT NULL");
+    expect(followup).toContain("revoke_reason");
+  });
 });

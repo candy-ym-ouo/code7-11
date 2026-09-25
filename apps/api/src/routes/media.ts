@@ -16,6 +16,7 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import { assertScopedPermission, mediaScopeTarget, resolveScopedActor } from "../delegation";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -183,6 +184,14 @@ export async function mediaRoutes(app: FastifyInstance) {
     const media = result.rows[0];
     if (!media) throw notFound("Media not found");
     if (!media.processed_object_key) throw conflict("Processed preview is not available");
+    // 预览也属于敏感访问，审核员必须持有覆盖该媒体的隐私确认委托。
+    if (request.user!.role !== "admin") {
+      await transaction(async (client) => {
+        const actor = await resolveScopedActor(client, request.user!);
+        const target = await mediaScopeTarget(client, params.id);
+        assertScopedPermission(actor, "media.privacy_approve", target);
+      });
+    }
     await query(
       `INSERT INTO audit_logs(actor_id, action, resource_type, resource_id, metadata)
        VALUES ($1, 'media.preview_viewed', 'media', $2, '{}'::jsonb)`,
@@ -218,6 +227,16 @@ export async function mediaRoutes(app: FastifyInstance) {
 
     const publicKey = `media/${params.id}.webp`;
     const thumbnailKey = `media/${params.id}.thumb.webp`;
+
+    // 隐私确认是高风险动作：范围断言必须在对象公开发布之前完成，避免越权产生副作用。
+    const check = await transaction(async (client) => {
+      const actor = await resolveScopedActor(client, request.user!);
+      const target = actor.isAdmin ? null : await mediaScopeTarget(client, params.id);
+      return actor.isAdmin
+        ? { highRisk: false }
+        : assertScopedPermission(actor, "media.privacy_approve", target ?? {});
+    });
+
     try {
       await publishMediaObject(media.processed_object_key, publicKey);
       if (media.thumbnail_object_key) await publishMediaObject(media.thumbnail_object_key, thumbnailKey);
@@ -234,7 +253,11 @@ export async function mediaRoutes(app: FastifyInstance) {
           actorId: request.user!.id,
           action: "media.privacy_approved",
           resourceType: "media",
-          resourceId: params.id
+          resourceId: params.id,
+          metadata: {
+            highRisk: check.highRisk,
+            ...(check.delegationId ? { delegationId: check.delegationId } : {})
+          }
         });
       });
     } catch (error) {

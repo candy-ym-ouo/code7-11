@@ -2,43 +2,175 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { moderationDecisionSchema } from "@map/shared/contracts";
 import { query, transaction } from "../db";
-import { AppError, conflict, notFound } from "../errors";
+import { conflict, forbidden, notFound } from "../errors";
 import { requireAdmin, requireModerator } from "../auth";
 import { recordAudit } from "../audit";
 import { notifyUser } from "../notifications";
+import {
+  assertScopedPermission,
+  resolveScopedActor,
+  scopeExistenceClause,
+  type PermissionCheck
+} from "../delegation";
+
+type ScopeTargetRow = {
+  category_key: string | null;
+  longitude: number | null;
+  latitude: number | null;
+};
+
+function scopeMeta(check: PermissionCheck): Record<string, unknown> {
+  return {
+    highRisk: check.highRisk,
+    ...(check.delegationId ? { delegationId: check.delegationId } : {})
+  };
+}
+
+// 待审修订的点来自待审 payload（批准后内容才真正落在该坐标）。
+const REVISION_POINT =
+  "ST_SetSRID(ST_MakePoint((fr.payload->>'longitude')::numeric, (fr.payload->>'latitude')::numeric), 4326)";
+const REVISION_CATEGORY = "fr.payload->>'categoryKey'";
 
 export async function moderationRoutes(app: FastifyInstance) {
-  app.get("/moderation/queue", { preHandler: requireModerator }, async () => {
+  app.get("/moderation/queue", { preHandler: requireModerator }, async (request) => {
+    const isAdmin = request.user!.role === "admin";
+    const actorId = request.user!.id;
+
     const [features, comments, media, reports] = await Promise.all([
       query(
         `SELECT fr.id AS revision_id, fr.feature_id, fr.revision_no, fr.payload, fr.submitted_at,
-                mf.category_key, mf.status AS feature_status, u.display_name AS author_name
+                fr.payload->>'categoryKey' AS category_key,
+                (fr.payload->>'longitude')::float8 AS longitude,
+                (fr.payload->>'latitude')::float8 AS latitude,
+                mf.status AS feature_status, u.display_name AS author_name
          FROM feature_revisions fr
          JOIN map_features mf ON mf.id = fr.feature_id
          JOIN users u ON u.id = fr.author_id
          WHERE fr.status = 'pending' AND mf.deleted_at IS NULL
+         ${
+           isAdmin
+             ? ""
+             : `AND ${scopeExistenceClause("$1", "$2", REVISION_CATEGORY, REVISION_POINT)}`
+         }
          ORDER BY fr.submitted_at ASC
-         LIMIT 100`
+         LIMIT 100`,
+        isAdmin ? [] : [actorId, "feature.approve"]
       ),
       query(
-        `SELECT c.id, c.feature_id, c.body, c.status, c.created_at, u.display_name AS author_name
-         FROM comments c JOIN users u ON u.id = c.author_id
+        `SELECT c.id, c.feature_id, c.body, c.status, c.created_at, u.display_name AS author_name,
+                mf.category_key, ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+         FROM comments c
+         JOIN users u ON u.id = c.author_id
+         JOIN map_features mf ON mf.id = c.feature_id
          WHERE c.status = 'pending' AND c.deleted_at IS NULL
-         ORDER BY c.created_at ASC LIMIT 100`
+         ${
+           isAdmin
+             ? ""
+             : `AND ${scopeExistenceClause("$1", "$2", "mf.category_key", "mf.geom::geometry")}`
+         }
+         ORDER BY c.created_at ASC LIMIT 100`,
+        isAdmin ? [] : [actorId, "comment.approve"]
       ),
+      // 媒体：挂到待审修订的跟随待审 payload；否则取最新关联修订对应地点；
+      // 完全没有关联内容的孤立媒体，只对“全分类、无地区限制”的审核员可见。
       query(
         `SELECT ma.id, ma.original_filename, ma.privacy_status, ma.privacy_report,
-                ma.processed_object_key, ma.created_at, u.display_name AS owner_name
-         FROM media_assets ma JOIN users u ON u.id = ma.owner_id
+                ma.processed_object_key, ma.created_at, u.display_name AS owner_name,
+                st.category_key, st.longitude, st.latitude
+         FROM media_assets ma
+         JOIN users u ON u.id = ma.owner_id
+         CROSS JOIN LATERAL (
+           SELECT
+             COALESCE(frp.payload->>'categoryKey', mf2.category_key) AS category_key,
+             COALESCE((frp.payload->>'longitude')::float8, ST_X(mf2.geom::geometry)) AS longitude,
+             COALESCE((frp.payload->>'latitude')::float8, ST_Y(mf2.geom::geometry)) AS latitude,
+             (frp.feature_id IS NULL AND mf2.id IS NULL) AS orphan
+           FROM (
+             SELECT
+               (
+                 SELECT fr_pending.feature_id
+                 FROM revision_media rm_p
+                 JOIN feature_revisions fr_pending ON fr_pending.id = rm_p.revision_id
+                 WHERE rm_p.media_id = ma.id AND fr_pending.status = 'pending'
+                 ORDER BY fr_pending.submitted_at DESC
+                 LIMIT 1
+               ) AS pending_feature_id,
+               (
+                 SELECT mf_latest.id
+                 FROM revision_media rm_l
+                 JOIN feature_revisions fr_latest ON fr_latest.id = rm_l.revision_id
+                 JOIN map_features mf_latest ON mf_latest.id = fr_latest.feature_id
+                 WHERE rm_l.media_id = ma.id AND mf_latest.deleted_at IS NULL
+                 ORDER BY fr_latest.created_at DESC
+                 LIMIT 1
+               ) AS latest_feature_id
+           ) picked
+           LEFT JOIN LATERAL (
+             SELECT payload FROM feature_revisions
+             WHERE feature_id = picked.pending_feature_id AND status = 'pending'
+             ORDER BY revision_no DESC
+             LIMIT 1
+           ) frp ON true
+           LEFT JOIN map_features mf2
+             ON mf2.id = COALESCE(picked.pending_feature_id, picked.latest_feature_id)
+         ) st
          WHERE ma.privacy_status = 'manual_review' AND ma.deleted_at IS NULL
-         ORDER BY ma.created_at ASC LIMIT 100`
+         ${
+           isAdmin
+             ? ""
+             : `AND (
+               ${scopeExistenceClause(
+                 "$1",
+                 "$2",
+                 "st.category_key",
+                 "ST_SetSRID(ST_MakePoint(st.longitude, st.latitude), 4326)",
+                 "mdm"
+               )}
+               OR (
+                 st.orphan
+                 AND EXISTS (
+                   SELECT 1 FROM moderation_delegations md0
+                   WHERE md0.grantee_id = $1 AND md0.revoked_at IS NULL AND md0.valid_until > now()
+                     AND 'media.privacy_approve'::moderation_permission = ANY(md0.permissions)
+                     AND md0.category_keys IS NULL
+                     AND md0.region IS NULL
+                 )
+               )
+             )`
+         }
+         ORDER BY ma.created_at ASC LIMIT 100`,
+        isAdmin ? [] : [actorId, "media.privacy_approve"]
       ),
       query(
         `SELECT r.id, r.target_type, r.target_id, r.reason_code, r.notes, r.created_at,
-                u.display_name AS reporter_name
-         FROM reports r JOIN users u ON u.id = r.reporter_id
+                u.display_name AS reporter_name,
+                scope_target.category_key, scope_target.longitude, scope_target.latitude
+         FROM reports r
+         JOIN users u ON u.id = r.reporter_id
+         CROSS JOIN LATERAL (
+           SELECT mf.category_key, ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+           FROM map_features mf
+           WHERE r.target_type = 'feature' AND mf.id = r.target_id AND mf.deleted_at IS NULL
+           UNION ALL
+           SELECT mf.category_key, ST_X(mf.geom::geometry), ST_Y(mf.geom::geometry)
+           FROM comments c
+           JOIN map_features mf ON mf.id = c.feature_id
+           WHERE r.target_type = 'comment' AND c.id = r.target_id AND c.deleted_at IS NULL AND mf.deleted_at IS NULL
+         ) scope_target ON true
          WHERE r.status = 'open'
-         ORDER BY r.created_at ASC LIMIT 100`
+         ${
+           isAdmin
+             ? ""
+             : `AND ${scopeExistenceClause(
+                 "$1",
+                 "$2",
+                 "scope_target.category_key",
+                 "ST_SetSRID(ST_MakePoint(scope_target.longitude, scope_target.latitude), 4326)",
+                 "mdr"
+               )}`
+         }
+         ORDER BY r.created_at ASC LIMIT 100`,
+        isAdmin ? [] : [actorId, "report.resolve"]
       )
     ]);
 
@@ -59,6 +191,7 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     await transaction(async (client) => {
+      const actor = await resolveScopedActor(client, request.user!);
       const revisionResult = await client.query<{
         id: string;
         payload: { categoryKey: string; longitude: number; latitude: number; locationAccuracyM: number; mediaIds?: string[] };
@@ -73,6 +206,12 @@ export async function moderationRoutes(app: FastifyInstance) {
       );
       const revision = revisionResult.rows[0];
       if (!revision) throw notFound("Pending revision not found");
+
+      const check = assertScopedPermission(actor, "feature.approve", {
+        categoryKey: revision.payload.categoryKey,
+        longitude: revision.payload.longitude,
+        latitude: revision.payload.latitude
+      });
 
       const mediaIds = revision.payload.mediaIds ?? [];
       if (mediaIds.length) {
@@ -118,7 +257,7 @@ export async function moderationRoutes(app: FastifyInstance) {
         action: "feature.approved",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { revisionId: revision.id }
+        metadata: { revisionId: revision.id, ...scopeMeta(check) }
       });
       await notifyUser(client, {
         userId: revision.author_id,
@@ -135,7 +274,13 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
+      const actor = await resolveScopedActor(client, request.user!);
       const revision = await activePendingRevision(client, params.id);
+      const check = assertScopedPermission(actor, "feature.reject", {
+        categoryKey: revision.payload.categoryKey,
+        longitude: revision.payload.longitude,
+        latitude: revision.payload.latitude
+      });
       await client.query(
         `UPDATE feature_revisions
          SET status = 'rejected', reviewed_at = now(), reviewer_id = $2,
@@ -155,7 +300,12 @@ export async function moderationRoutes(app: FastifyInstance) {
         action: "feature.rejected",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { revisionId: revision.id, reasonCode: input.reasonCode, notes: input.notes }
+        metadata: {
+          revisionId: revision.id,
+          reasonCode: input.reasonCode,
+          notes: input.notes,
+          ...scopeMeta(check)
+        }
       });
       await notifyUser(client, {
         userId: revision.author_id,
@@ -172,7 +322,13 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
+      const actor = await resolveScopedActor(client, request.user!);
       const revision = await activePendingRevision(client, params.id);
+      const check = assertScopedPermission(actor, "feature.request_changes", {
+        categoryKey: revision.payload.categoryKey,
+        longitude: revision.payload.longitude,
+        latitude: revision.payload.latitude
+      });
       await client.query(
         `UPDATE feature_revisions
          SET status = 'changes_requested', reviewed_at = now(), reviewer_id = $2,
@@ -192,7 +348,11 @@ export async function moderationRoutes(app: FastifyInstance) {
         action: "feature.changes_requested",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { revisionId: revision.id, reasonCode: input.reasonCode }
+        metadata: {
+          revisionId: revision.id,
+          reasonCode: input.reasonCode,
+          ...scopeMeta(check)
+        }
       });
       await notifyUser(client, {
         userId: revision.author_id,
@@ -209,18 +369,28 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
-      const result = await client.query(
-        "UPDATE map_features SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING owner_id, current_revision_id",
+      const actor = await resolveScopedActor(client, request.user!);
+      const result = await client.query<{ owner_id: string } & ScopeTargetRow>(
+        `SELECT owner_id, category_key,
+                ST_X(geom::geometry) AS longitude, ST_Y(geom::geometry) AS latitude
+         FROM map_features
+         WHERE id = $1 AND deleted_at IS NULL
+         FOR UPDATE`,
         [params.id]
       );
       const feature = result.rows[0];
       if (!feature) throw notFound("Feature not found");
+      const check = assertScopedPermission(actor, "feature.hide", feature);
+      await client.query(
+        "UPDATE map_features SET status = 'hidden', updated_at = now() WHERE id = $1",
+        [params.id]
+      );
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "feature.hidden",
         resourceType: "feature",
         resourceId: params.id,
-        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+        metadata: { reasonCode: input.reasonCode, notes: input.notes, ...scopeMeta(check) }
       });
       await notifyUser(client, {
         userId: feature.owner_id,
@@ -233,6 +403,7 @@ export async function moderationRoutes(app: FastifyInstance) {
     return { status: "hidden" };
   });
 
+  // 恢复是仅管理员动作，不允许通过临时委托获得。
   app.post("/moderation/features/:id/restore", { preHandler: requireAdmin }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     await transaction(async (client) => {
@@ -257,19 +428,30 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/comments/:id/approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     await transaction(async (client) => {
-      const result = await client.query<{ author_id: string }>(
+      const actor = await resolveScopedActor(client, request.user!);
+      const pending = await client.query<{ author_id: string; status: string } & ScopeTargetRow>(
+        `SELECT c.author_id, c.status, mf.category_key,
+                ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+         FROM comments c
+         JOIN map_features mf ON mf.id = c.feature_id
+         WHERE c.id = $1 AND c.status = 'pending' AND c.deleted_at IS NULL
+         FOR UPDATE OF c`,
+        [params.id]
+      );
+      const comment = pending.rows[0];
+      if (!comment) throw notFound("Pending comment not found");
+      assertScopedPermission(actor, "comment.approve", comment);
+      await client.query(
         `UPDATE comments SET status = 'published', reviewed_at = now(), reviewer_id = $2,
-             rejection_reason_code = NULL, updated_at = now()
-         WHERE id = $1 AND status = 'pending' AND deleted_at IS NULL RETURNING author_id`,
+             rejection_reason_code = NULL, updated_at = now() WHERE id = $1`,
         [params.id, request.user!.id]
       );
-      const comment = result.rows[0];
-      if (!comment) throw notFound("Pending comment not found");
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "comment.approved",
         resourceType: "comment",
-        resourceId: params.id
+        resourceId: params.id,
+        metadata: {}
       });
       await notifyUser(client, {
         userId: comment.author_id,
@@ -286,20 +468,30 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
-      const result = await client.query<{ author_id: string }>(
+      const actor = await resolveScopedActor(client, request.user!);
+      const pending = await client.query<{ author_id: string } & ScopeTargetRow>(
+        `SELECT c.author_id, mf.category_key,
+                ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+         FROM comments c
+         JOIN map_features mf ON mf.id = c.feature_id
+         WHERE c.id = $1 AND c.status IN ('pending', 'published') AND c.deleted_at IS NULL
+         FOR UPDATE OF c`,
+        [params.id]
+      );
+      const comment = pending.rows[0];
+      if (!comment) throw notFound("Comment not found");
+      const check = assertScopedPermission(actor, "comment.reject", comment);
+      await client.query(
         `UPDATE comments SET status = 'rejected', reviewed_at = now(), reviewer_id = $2,
-             rejection_reason_code = $3, updated_at = now()
-         WHERE id = $1 AND status IN ('pending', 'published') AND deleted_at IS NULL RETURNING author_id`,
+             rejection_reason_code = $3, updated_at = now() WHERE id = $1`,
         [params.id, request.user!.id, input.reasonCode]
       );
-      const comment = result.rows[0];
-      if (!comment) throw notFound("Comment not found");
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "comment.rejected",
         resourceType: "comment",
         resourceId: params.id,
-        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+        metadata: { reasonCode: input.reasonCode, notes: input.notes, ...scopeMeta(check) }
       });
       await notifyUser(client, {
         userId: comment.author_id,
@@ -316,17 +508,29 @@ export async function moderationRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = moderationDecisionSchema.parse(request.body);
     await transaction(async (client) => {
-      const result = await client.query(
+      const actor = await resolveScopedActor(client, request.user!);
+      const pending = await client.query<ScopeTargetRow>(
+        `SELECT mf.category_key, ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+         FROM comments c
+         JOIN map_features mf ON mf.id = c.feature_id
+         WHERE c.id = $1 AND c.deleted_at IS NULL
+         FOR UPDATE OF c`,
+        [params.id]
+      );
+      const target = pending.rows[0];
+      if (!target) throw notFound("Comment not found");
+      const check = assertScopedPermission(actor, "comment.hide", target);
+      const updated = await client.query(
         "UPDATE comments SET status = 'hidden', updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id",
         [params.id]
       );
-      if (!result.rowCount) throw notFound("Comment not found");
+      if (!updated.rowCount) throw notFound("Comment not found");
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "comment.hidden",
         resourceType: "comment",
         resourceId: params.id,
-        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+        metadata: { reasonCode: input.reasonCode, notes: input.notes, ...scopeMeta(check) }
       });
     });
     return { status: "hidden" };
@@ -341,12 +545,47 @@ export async function moderationRoutes(app: FastifyInstance) {
     }).parse(request.body);
 
     await transaction(async (client) => {
+      const actor = await resolveScopedActor(client, request.user!);
       const reportResult = await client.query<{ target_type: string; target_id: string; reporter_id: string }>(
         "SELECT target_type, target_id, reporter_id FROM reports WHERE id = $1 AND status = 'open' FOR UPDATE",
         [params.id]
       );
       const report = reportResult.rows[0];
       if (!report) throw notFound("Open report not found");
+
+      // 解析举报目标的分类与坐标，用于委托范围校验。
+      const targetResult =
+        report.target_type === "feature"
+          ? await client.query<ScopeTargetRow>(
+              `SELECT category_key, ST_X(geom::geometry) AS longitude, ST_Y(geom::geometry) AS latitude
+               FROM map_features WHERE id = $1 AND deleted_at IS NULL`,
+              [report.target_id]
+            )
+          : await client.query<ScopeTargetRow>(
+              `SELECT mf.category_key, ST_X(mf.geom::geometry) AS longitude, ST_Y(mf.geom::geometry) AS latitude
+               FROM comments c JOIN map_features mf ON mf.id = c.feature_id
+               WHERE c.id = $1 AND c.deleted_at IS NULL AND mf.deleted_at IS NULL`,
+              [report.target_id]
+            );
+      const target = targetResult.rows[0] ?? null;
+
+      if (input.action === "restore" && !actor.isAdmin) {
+        throw forbidden("恢复内容仅限管理员，不能通过临时委托执行");
+      }
+
+      // “隐藏”按目标类型检查对应隐藏权限；其余动作检查举报处理权限。
+      // 目标已删除时没有分类/坐标，只能由管理员或“全分类、无地区限制”的委托处理。
+      let check: PermissionCheck;
+      if (input.action === "hide") {
+        if (!target) throw notFound("Reported target no longer exists");
+        check = assertScopedPermission(
+          actor,
+          report.target_type === "feature" ? "feature.hide" : "comment.hide",
+          target
+        );
+      } else {
+        check = assertScopedPermission(actor, "report.resolve", target ?? {});
+      }
 
       if (input.action === "hide") {
         const table = report.target_type === "feature" ? "map_features" : "comments";
@@ -369,7 +608,14 @@ export async function moderationRoutes(app: FastifyInstance) {
         action: "report.resolved",
         resourceType: "report",
         resourceId: params.id,
-        metadata: { status: input.status, action: input.action, notes: input.notes, targetType: report.target_type, targetId: report.target_id }
+        metadata: {
+          status: input.status,
+          action: input.action,
+          notes: input.notes,
+          targetType: report.target_type,
+          targetId: report.target_id,
+          ...scopeMeta(check)
+        }
       });
       await notifyUser(client, {
         userId: report.reporter_id,
@@ -385,11 +631,24 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.get("/moderation/audit", { preHandler: requireAdmin }, async (request) => {
     const input = z.object({
       limit: z.coerce.number().int().min(1).max(200).default(100),
-      resourceType: z.string().optional()
+      resourceType: z.string().optional(),
+      action: z.string().optional(),
+      delegationOnly: z.coerce.boolean().optional()
     }).parse(request.query);
     const values: unknown[] = [input.limit];
-    const where = input.resourceType ? "WHERE resource_type = $2" : "";
-    if (input.resourceType) values.push(input.resourceType);
+    const conditions: string[] = [];
+    if (input.resourceType) {
+      values.push(input.resourceType);
+      conditions.push(`al.resource_type = $${values.length}`);
+    }
+    if (input.action) {
+      values.push(`${input.action}%`);
+      conditions.push(`al.action LIKE $${values.length}`);
+    }
+    if (input.delegationOnly) {
+      conditions.push("(al.metadata ? 'delegationId' OR al.action LIKE 'delegation.%')");
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const result = await query(
       `SELECT al.id, al.actor_id, u.display_name AS actor_name, al.action,
               al.resource_type, al.resource_id, al.metadata, al.created_at
@@ -402,11 +661,19 @@ export async function moderationRoutes(app: FastifyInstance) {
   });
 }
 
-async function activePendingRevision(client: Parameters<Parameters<typeof transaction>[0]>[0], featureId: string) {
-  const result = await client.query<{ id: string; author_id: string }>(
-    `SELECT id, author_id FROM feature_revisions
-     WHERE feature_id = $1 AND status = 'pending'
-     ORDER BY revision_no DESC LIMIT 1 FOR UPDATE`,
+async function activePendingRevision(
+  client: Parameters<Parameters<typeof transaction>[0]>[0],
+  featureId: string
+) {
+  const result = await client.query<{
+    id: string;
+    author_id: string;
+    payload: { categoryKey: string; longitude: number; latitude: number };
+  }>(
+    `SELECT fr.id, fr.author_id, fr.payload
+     FROM feature_revisions fr
+     WHERE fr.feature_id = $1 AND fr.status = 'pending'
+     ORDER BY fr.revision_no DESC LIMIT 1 FOR UPDATE`,
     [featureId]
   );
   const revision = result.rows[0];

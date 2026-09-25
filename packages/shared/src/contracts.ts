@@ -200,6 +200,211 @@ export const moderationDecisionSchema = z.object({
   notes: z.string().trim().max(1000).optional()
 });
 
+/* ============================================================
+   审核权限委托（Delegation）
+   管理员按分类与地区，把部分审核动作临时委托给审核员。
+   纯判断函数同时被 API（服务端强制）与 Web（页面层隐藏）复用。
+   ============================================================ */
+
+export const MODERATION_PERMISSIONS = [
+  "feature.approve",
+  "feature.reject",
+  "feature.request_changes",
+  "feature.hide",
+  "comment.approve",
+  "comment.reject",
+  "comment.hide",
+  "media.privacy_approve",
+  "report.resolve"
+] as const;
+export type ModerationPermission = (typeof MODERATION_PERMISSIONS)[number];
+
+// 拒绝、隐藏、举报处理与媒体隐私确认属于高风险动作，与委托/撤销一并进入审计。
+export const HIGH_RISK_PERMISSIONS = [
+  "feature.reject",
+  "feature.hide",
+  "comment.reject",
+  "comment.hide",
+  "media.privacy_approve",
+  "report.resolve"
+] as const satisfies readonly ModerationPermission[];
+
+export function isHighRiskPermission(permission: ModerationPermission): boolean {
+  return (HIGH_RISK_PERMISSIONS as readonly string[]).includes(permission);
+}
+
+export const MODERATION_PERMISSION_LABELS = {
+  "feature.approve": "批准地点内容",
+  "feature.reject": "拒绝地点内容",
+  "feature.request_changes": "要求修改",
+  "feature.hide": "隐藏地点内容",
+  "comment.approve": "批准评论",
+  "comment.reject": "拒绝评论",
+  "comment.hide": "隐藏评论",
+  "media.privacy_approve": "确认媒体隐私并发布",
+  "report.resolve": "处理举报"
+} as const satisfies Record<ModerationPermission, string>;
+
+export type LngLat = readonly [number, number];
+export type LngLatBBox = readonly [number, number, number, number];
+
+export type BBoxRegion = { type: "bbox"; bbox: LngLatBBox };
+export type PolygonRegion = { type: "Polygon"; coordinates: LngLat[][] };
+export type DelegationRegion = BBoxRegion | PolygonRegion;
+
+// 一次委托的有效范围：权限集合 × 分类集合（空=全部分类） × 地理区域（null=不限地区）。
+export type DelegationScope = {
+  permissions: ModerationPermission[];
+  categoryKeys: string[];
+  region: DelegationRegion | null;
+};
+
+const pointPositionSchema = z.tuple([
+  z.number().min(-180).max(180),
+  z.number().min(-90).max(90)
+]);
+
+const linearRingSchema = z
+  .array(pointPositionSchema)
+  .min(4, "Polygon rings need at least four positions")
+  .refine(
+    (ring) => {
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      return Boolean(first && last && first[0] === last[0] && first[1] === last[1]);
+    },
+    { message: "Polygon rings must be closed" }
+  );
+
+const bboxRegionSchema = z
+  .object({
+    type: z.literal("bbox"),
+    bbox: z.tuple([
+      z.number().min(-180).max(180),
+      z.number().min(-90).max(90),
+      z.number().min(-180).max(180),
+      z.number().min(-90).max(90)
+    ])
+  })
+  .strict()
+  .refine((value) => value.bbox[0] < value.bbox[2] && value.bbox[1] < value.bbox[3], {
+    message: "bbox minimum longitude/latitude must be smaller than maximum"
+  });
+
+const polygonRegionSchema = z
+  .object({
+    type: z.literal("Polygon"),
+    coordinates: z.array(linearRingSchema).min(1, "Polygon needs at least one ring")
+  })
+  .strict();
+
+export const delegationRegionSchema = z.discriminatedUnion("type", [bboxRegionSchema, polygonRegionSchema]);
+
+export const delegationCreateSchema = z
+  .object({
+    granteeId: z.string().uuid(),
+    permissions: z.array(z.enum(MODERATION_PERMISSIONS)).min(1).max(20),
+    categoryKeys: z.array(z.enum(categoryKeys)).max(categoryKeys.length).default([]),
+    region: delegationRegionSchema.nullable().default(null),
+    validUntil: z.string().datetime({ offset: true }),
+    reason: z.string().trim().min(2).max(500)
+  })
+  .superRefine((value, context) => {
+    if (new Set(value.permissions).size !== value.permissions.length) {
+      context.addIssue({ code: "custom", path: ["permissions"], message: "Permissions must be unique" });
+    }
+    if (new Set(value.categoryKeys).size !== value.categoryKeys.length) {
+      context.addIssue({ code: "custom", path: ["categoryKeys"], message: "Category keys must be unique" });
+    }
+  });
+
+export const delegationRevokeSchema = z.object({
+  reason: z.string().trim().min(2).max(300)
+});
+
+export function pointInBBox(lon: number, lat: number, bbox: LngLatBBox): boolean {
+  return lon >= bbox[0] && lon <= bbox[2] && lat >= bbox[1] && lat <= bbox[3];
+}
+
+// 射线法判断点是否在线性环内；外环在内、洞环在外。
+export function pointInRing(lon: number, lat: number, ring: readonly LngLat[]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const vi = ring[i];
+    const vj = ring[j];
+    if (!vi || !vj) continue;
+    const [xi, yi] = vi;
+    const [xj, yj] = vj;
+    const intersects =
+      yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+export function pointInPolygon(lon: number, lat: number, rings: readonly LngLat[][]): boolean {
+  const outer = rings[0];
+  if (!outer || !pointInRing(lon, lat, outer)) return false;
+  for (let i = 1; i < rings.length; i++) {
+    const hole = rings[i];
+    if (hole && pointInRing(lon, lat, hole)) return false;
+  }
+  return true;
+}
+
+export function pointInRegion(lon: number, lat: number, region: DelegationRegion): boolean {
+  if (region.type === "bbox") return pointInBBox(lon, lat, region.bbox);
+  return pointInPolygon(lon, lat, region.coordinates);
+}
+
+// 供 PostGIS ST_GeomFromGeoJSON 使用：bbox 也规范化成闭合 Polygon。
+export function regionToPolygonGeoJson(region: DelegationRegion): PolygonRegion {
+  if (region.type === "Polygon") return { type: "Polygon", coordinates: region.coordinates };
+  const [minLon, minLat, maxLon, maxLat] = region.bbox;
+  return {
+    type: "Polygon",
+    coordinates: [
+      [
+        [minLon, minLat],
+        [maxLon, minLat],
+        [maxLon, maxLat],
+        [minLon, maxLat],
+        [minLon, minLat]
+      ]
+    ]
+  };
+}
+
+export type ScopeTarget = {
+  categoryKey?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+};
+
+export function scopeAllows(scope: DelegationScope, permission: ModerationPermission, target: ScopeTarget): boolean {
+  if (!scope.permissions.includes(permission)) return false;
+  if (scope.categoryKeys.length > 0) {
+    if (!target.categoryKey || !scope.categoryKeys.includes(target.categoryKey)) return false;
+  }
+  if (scope.region) {
+    if (typeof target.longitude !== "number" || typeof target.latitude !== "number") return false;
+    if (!pointInRegion(target.longitude, target.latitude, scope.region)) return false;
+  }
+  return true;
+}
+
+// 返回第一条允许该动作的委托范围；没有则返回 null（调用方据此拒绝越权）。
+export function scopesAllow(
+  scopes: readonly DelegationScope[],
+  permission: ModerationPermission,
+  target: ScopeTarget
+): DelegationScope | null {
+  for (const scope of scopes) {
+    if (scopeAllows(scope, permission, target)) return scope;
+  }
+  return null;
+}
+
 export const reportCreateSchema = z.object({
   targetType: z.enum(["feature", "comment"]),
   targetId: z.string().uuid(),
